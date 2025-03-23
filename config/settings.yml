@@ -1,0 +1,27 @@
+data_storage:
+  path: "data/corpus"
+model:
+  name: "default_model"
+  parameters:
+    temperature: 0.7
+    max_tokens: 150
+
+# LLM settings
+llm:
+  provider: "lm_studio"  # Options: lm_studio, openai, etc.
+  model_name: "local-model"  # Default model name
+  temperature: 0.7
+  max_tokens: 2048
+
+# Search settings
+search:
+  index_file: "data/corpus/index.json"
+  results_limit: 10
+  default_iterations: 2
+  max_iterations: 5
+  results_per_search: 8
+  content_fetch_limit: 10
+  
+# File settings
+paths:
+  results_dir: "results"
