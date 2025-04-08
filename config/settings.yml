@@ -17,8 +17,8 @@ llm:
 search:
   index_file: "data/corpus/index.json"
   results_limit: 10
-  default_iterations: 2
-  max_iterations: 5
+  default_iterations: 5
+  max_iterations: 10
   results_per_search: 8
   content_fetch_limit: 10
   

@@ -1,15 +1,246 @@
 import requests
 import json
-import re 
+import re
+import os
+import traceback
+from dotenv import load_dotenv
+from openai import OpenAI
 
+# Load environment variables from .env file
+load_dotenv()
 
 class LmStudioClient:
-    def __init__(self, api_base="http://192.168.1.69:1234/v1"):
-        self.api_base = api_base
+    def __init__(self, api_base=None, backend="lm_studio"):
+        """
+        Initialize the client with support for both LM Studio and OpenAI.
+        
+        Args:
+            api_base: Base URL for LM Studio API (defaults to value from .env)
+            backend: Either "lm_studio" or "openai" (default: "lm_studio")
+        """
+        # Load from environment if not provided
+        self.lm_studio_api_base = api_base or os.getenv("LM_STUDIO_API_BASE", "http://localhost:1234/v1")
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        # Initialize OpenAI client if API key is available
+        if self.openai_api_key:
+            self.openai_client = OpenAI(api_key=self.openai_api_key)
+        else:
+            self.openai_client = None
+            
+        # Set default backend
+        self.set_backend(backend)
         self.model_name = None
-
-    def set_model(self, model_name):
-        self.model_name = model_name
+        self.openai_model = "gpt-4o-mini"  # Default OpenAI model
+        
+    def set_backend(self, backend, method_overrides=None):
+        """
+        Set the backend to use for generating responses.
+        
+        Args:
+            backend: Either "lm_studio" or "openai"
+            method_overrides: Optional dict of methods that should use a specific backend
+                             regardless of the default setting (e.g. {"generate_page_understanding": "openai"})
+        """
+        if backend not in ["lm_studio", "openai"]:
+            raise ValueError("Backend must be either 'lm_studio' or 'openai'")
+            
+        if backend == "openai" and not self.openai_api_key:
+            raise ValueError("OpenAI backend selected but no API key provided. Add OPENAI_API_KEY to your .env file.")
+            
+        self.backend = backend
+        self.method_overrides = method_overrides or {}
+        
+    def set_model(self, model_name, backend=None):
+        """
+        Set the model to use for the specified backend.
+        
+        Args:
+            model_name: The model name to use
+            backend: Which backend this model applies to (if None, uses current default backend)
+        """
+        if backend is None:
+            backend = self.backend
+            
+        if backend == "lm_studio":
+            self.model_name = model_name
+        elif backend == "openai":
+            self.openai_model = model_name
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+    
+    def _get_backend_for_method(self, method_name):
+        """
+        Determine which backend to use for a given method based on overrides.
+        
+        Args:
+            method_name: Name of the method being called
+            
+        Returns:
+            Either "lm_studio" or "openai"
+        """
+        return self.method_overrides.get(method_name, self.backend)
+    
+    def generate_response(self, prompt, temperature=0.7, max_tokens=1024, schema=None, method_name=None, backend=None):
+        """
+        Generate a response using either LM Studio or OpenAI based on current backend.
+        
+        Args:
+            prompt: The user's input text
+            temperature: Controls randomness (0.0 to 1.0)
+            max_tokens: Maximum number of tokens to generate
+            schema: Optional JSON schema to enforce structured output
+            method_name: Name of the calling method for backend selection
+            backend: Explicitly override backend for this specific request ("lm_studio" or "openai")
+            
+        Returns:
+            The generated text response, formatted according to schema if provided
+        """
+        # Determine which backend to use with priority:
+        # 1. Explicit backend parameter
+        # 2. Method override
+        # 3. Default backend
+        if backend and backend in ["lm_studio", "openai"]:
+            use_backend = backend
+        elif method_name and method_name in self.method_overrides:
+            use_backend = self.method_overrides[method_name]
+        else:
+            use_backend = self.backend
+            
+        # Call appropriate implementation
+        if use_backend == "lm_studio":
+            return self._generate_response_lm_studio(prompt, temperature, max_tokens, schema)
+        elif use_backend == "openai":
+            return self._generate_response_openai(prompt, temperature, max_tokens, schema)
+        else:
+            raise ValueError(f"Unknown backend: {use_backend}")
+    
+    def _generate_response_lm_studio(self, prompt, temperature=0.7, max_tokens=1024, schema=None):
+        """LM Studio implementation of generate_response"""
+        if self.model_name is None:
+            raise ValueError("Model not set. Please set a model using set_model().")
+        
+        url = f"{self.lm_studio_api_base}/chat/completions"
+        
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        # Add response_format with schema if provided
+        if schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_structure",
+                    "schema": schema
+                }
+            }
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            response.raise_for_status()
+            
+            result = response.json()
+            # Extract the content from the response
+            content = result["choices"][0]["message"]["content"]
+            # Remove any <think>...</think> sections, including the tags
+            cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+            
+            # If schema was provided, handle JSON
+            if schema:
+                # Check if the content is enclosed in a JSON code block
+                match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
+                if match:
+                    json_str = match.group(1).strip()
+                else:
+                    json_str = cleaned_content.strip()
+                
+                try:
+                    parsed_json = json.loads(json_str)
+                    return parsed_json
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Response did not contain valid JSON despite schema: {e}")
+                    # Fall back to returning the raw string if parsing fails
+                    return json_str
+        
+            # Regular content processing (no schema or fallback)
+            # Check if the cleaned content is enclosed in a JSON code block
+            match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
+            if match:
+                cleaned_content = match.group(1)
+            
+            # Return the cleaned content with any leading/trailing whitespace removed
+            return cleaned_content.strip()
+        except requests.exceptions.RequestException as e:
+            print(f"Error communicating with LM Studio API: {e}")
+            return f"Error: {str(e)}"
+    
+    def _generate_response_openai(self, prompt, temperature=0.7, max_tokens=1024, schema=None):
+        """OpenAI implementation of generate_response using function calling with provided schema"""
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized. Check your API key.")
+        
+        messages = [{"role": "user", "content": prompt}]
+        
+        try:
+            if schema:
+                # Use the provided schema directly as function parameters
+                function_name = "generate_structured_response"
+                
+                # Define the tool/function using the exact schema provided
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "description": "Generate a structured response based on the user query",
+                            "parameters": schema  # Use the schema exactly as provided
+                        }
+                    }
+                ]
+                
+                # Call OpenAI API with function calling
+                response = self.openai_client.chat.completions.create(
+                    model=self.openai_model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice={"type": "function", "function": {"name": function_name}},
+                    temperature=temperature,
+                    max_tokens=max_tokens,  
+                    response_format={ "type": "json_object" }
+                )
+                
+                # Extract the function call arguments
+                tool_call = response.choices[0].message.tool_calls[0]
+                function_args = json.loads(tool_call.function.arguments)
+                
+                return function_args
+            else:
+                # For regular text responses without schema
+                response = self.openai_client.chat.completions.create(
+                    model=self.openai_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+                # Extract content from response
+                content = response.choices[0].message.content
+                return content
+                
+        except Exception as e:
+            print(f"Error generating response with OpenAI: {e}")
+            print(f"Exception details: {str(e)}")
+            traceback.print_exc()
+            return f"Error: {str(e)}"
 
     def generate_search_query(self, user_query):
         """
@@ -63,89 +294,90 @@ class LmStudioClient:
         except Exception as e:
             print(f"Error generating search query: {e}")
             return user_query  # Fallback to original query
-    def generate_response(self, prompt, temperature=0.7, max_tokens=1024, schema=None):
-        """
-        Generate a response using the LM Studio local API.
         
-        Args:
-            prompt: The user's input text
-            temperature: Controls randomness (0.0 to 1.0)
-            max_tokens: Maximum number of tokens to generate
-            schema: Optional JSON schema to enforce structured output
+    # def generate_response(self, prompt, temperature=0.7, max_tokens=1024, schema=None):
+    #     """
+    #     Generate a response using the LM Studio local API.
+        
+    #     Args:
+    #         prompt: The user's input text
+    #         temperature: Controls randomness (0.0 to 1.0)
+    #         max_tokens: Maximum number of tokens to generate
+    #         schema: Optional JSON schema to enforce structured output
             
-        Returns:
-            The generated text response, formatted according to schema if provided
-        """
-        if self.model_name is None:
-            raise ValueError("Model not set. Please set a model using set_model().")
+    #     Returns:
+    #         The generated text response, formatted according to schema if provided
+    #     """
+    #     if self.model_name is None:
+    #         raise ValueError("Model not set. Please set a model using set_model().")
         
-        url = f"{self.api_base}/chat/completions"
+    #     url = f"{self.api_base}/chat/completions"
         
-        payload = {
-            "model": self.model_name,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
+    #     payload = {
+    #         "model": self.model_name,
+    #         "messages": [
+    #             {"role": "user", "content": prompt}
+    #         ],
+    #         "temperature": temperature,
+    #         "max_tokens": max_tokens
+    #     }
         
-        # Add response_format with schema if provided (CORRECTED FORMAT)
-        if schema:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "response_structure",  # Add a name for the schema
-                    "schema": schema  # Your actual schema definition goes here
-                }
-            }
+    #     # Add response_format with schema if provided (CORRECTED FORMAT)
+    #     if schema:
+    #         payload["response_format"] = {
+    #             "type": "json_schema",
+    #             "json_schema": {
+    #                 "name": "response_structure",  # Add a name for the schema
+    #                 "schema": schema  # Your actual schema definition goes here
+    #             }
+    #         }
         
-        headers = {
-            "Content-Type": "application/json"
-        }
-        try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload))
-            response.raise_for_status()  # Raise exception for HTTP errors
+    #     headers = {
+    #         "Content-Type": "application/json"
+    #     }
+    #     try:
+    #         response = requests.post(url, headers=headers, data=json.dumps(payload))
+    #         response.raise_for_status()  # Raise exception for HTTP errors
             
-            result = response.json()
-            # Extract the content from the response
-            content = result["choices"][0]["message"]["content"]
-            # Remove any <think>...</think> sections, including the tags
-            cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    #         result = response.json()
+    #         # Extract the content from the response
+    #         content = result["choices"][0]["message"]["content"]
+    #         # Remove any <think>...</think> sections, including the tags
+    #         cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
             
-            # If schema was provided, handle JSON
-            if schema:
-                # Check if the content is enclosed in a JSON code block
-                match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
-                if match:
-                    json_str = match.group(1).strip()
-                else:
-                    json_str = cleaned_content.strip()
+    #         # If schema was provided, handle JSON
+    #         if schema:
+    #             # Check if the content is enclosed in a JSON code block
+    #             match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
+    #             if match:
+    #                 json_str = match.group(1).strip()
+    #             else:
+    #                 json_str = cleaned_content.strip()
                 
-                # If requested, return the raw JSON string for debugging
-                # if return_raw_json:
-                #     return json_str
+    #             # If requested, return the raw JSON string for debugging
+    #             # if return_raw_json:
+    #             #     return json_str
                     
-                # Otherwise parse the JSON as before
-                try:
-                    parsed_json = json.loads(json_str)
-                    return parsed_json
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Response did not contain valid JSON despite schema: {e}")
-                    # Fall back to returning the raw string if parsing fails
-                    return json_str
+    #             # Otherwise parse the JSON as before
+    #             try:
+    #                 parsed_json = json.loads(json_str)
+    #                 return parsed_json
+    #             except json.JSONDecodeError as e:
+    #                 print(f"Warning: Response did not contain valid JSON despite schema: {e}")
+    #                 # Fall back to returning the raw string if parsing fails
+    #                 return json_str
         
-            # Regular content processing (no schema or fallback)
-            # Check if the cleaned content is enclosed in a JSON code block
-            match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
-            if match:
-                cleaned_content = match.group(1)
+    #         # Regular content processing (no schema or fallback)
+    #         # Check if the cleaned content is enclosed in a JSON code block
+    #         match = re.search(r'```json\s*(.*?)\s*```', cleaned_content, flags=re.DOTALL)
+    #         if match:
+    #             cleaned_content = match.group(1)
             
-            # Return the cleaned content with any leading/trailing whitespace removed
-            return cleaned_content.strip()
-        except requests.exceptions.RequestException as e:
-            print(f"Error communicating with LM Studio API: {e}")
-            return f"Error: {str(e)}"
+    #         # Return the cleaned content with any leading/trailing whitespace removed
+    #         return cleaned_content.strip()
+    #     except requests.exceptions.RequestException as e:
+    #         print(f"Error communicating with LM Studio API: {e}")
+    #         return f"Error: {str(e)}"
             
     def chat_completion(self, messages, temperature=0.7, max_tokens=1024):
         """
@@ -236,6 +468,7 @@ class LmStudioClient:
 
     Format your response as a JSON object with a single field:
     {{
+    "thinking": "Your analysis process and reasoning behind the answer",
     "answer": "Your detailed, comprehensive answer that synthesizes information from multiple sources here..."
     }}
 
@@ -247,13 +480,14 @@ class LmStudioClient:
     {context}
 
     In your answer, please:
-    - Provide a concise explanation based on the current available information.
+    - Provide a detailed explanation based on the current available information.
     - Outline the key points in bullet format.
     - Briefly describe the thought process behind your answer.
     - Keep your response succinct while ensuring clarity.
 
     Format your response as a JSON object with a single field:
     {{
+    "thinking": "Your analysis process and reasoning behind the answer",
     "answer": "Your concise intermediate answer based on the current information here..."
     }}
 
@@ -276,7 +510,7 @@ class LmStudioClient:
         }
         
         # Generate response using the prompt with schema
-        response_json = self.generate_response(prompt, schema=answer_schema)
+        response_json = self.generate_response(prompt, schema=answer_schema, backend="openai")
         
         
         # # Remove any markdown code block markers if present
@@ -305,7 +539,7 @@ class LmStudioClient:
 
         Based on these results, what {max_queries} additional search queries should I make to get more comprehensive information?
         Focus on different aspects of the original question or follow up on interesting leads in the current results.
-        The goal is to build a more complete understanding of the topic through multiple searches.
+        The goal is to build a more complete understanding of the topic through multiple searches. don't be afraid to get creative! we need to cover a wide range of relevant information.
 
         Format your response as a JSON object with a single field "queries" containing an array of exactly {max_queries} search queries:
 
@@ -524,7 +758,7 @@ class LmStudioClient:
         }
 
         try:
-            response = self.generate_response(prompt, schema=outline_schema, temperature=0.5)
+            response = self.generate_response(prompt, schema=outline_schema, temperature=0.5, backend="openai")
             
             
             # If we received a dictionary directly, return it
@@ -592,7 +826,7 @@ Return ONLY a JSON object in the following format:
 """
 
         try:
-            response_text = self.generate_response(prompt)
+            response_text = self.generate_response(prompt, backend="openai")
             try:
                 # Remove code fence markers
                 if response_text.startswith("```json"):
@@ -668,9 +902,9 @@ Return ONLY a JSON object in the following format:
         if not sections:
             print("Warning: Could not parse outline into sections. Using default structure.")
             sections = [
-                {'header': '## Introduction', 'content': []},
-                {'header': '## Main Discussion', 'content': []},
-                {'header': '## Conclusion', 'content': []}
+            {'header': '## Introduction', 'content': []},
+            {'header': '## Main Discussion', 'content': []},
+            {'header': '## Conclusion', 'content': []}
             ]
         
         print(f"Parsed outline into {len(sections)} sections and subsections")
@@ -687,6 +921,11 @@ Return ONLY a JSON object in the following format:
             text_so_far = "\n\n".join(final_markdown_sections)
             section_header = section['header']
             
+            # Include the content bullets from the outline in the section header
+            section_content_points = ""
+            if section.get('content') and len(section['content']) > 0:
+                section_content_points = "\nOutline points:\n" + "\n".join(section['content'])
+            
             # Get the sequential source IDs allocated to this section
             sequential_source_ids = section_to_sources.get(section_header, [])
             
@@ -700,15 +939,22 @@ Return ONLY a JSON object in the following format:
             
             # If no sources mapped, use keyword-based filtering as fallback
             if not section_evidence:
-                section_keywords = self._extract_keywords_from_header(section_header)
+                # Extract keywords from both header and content bullets
+                header_keywords = self._extract_keywords_from_header(section_header)
+                    
+                content_keywords = []
+                for bullet in section.get('content', []):
+                    content_keywords.extend(self._extract_keywords_from_text(bullet))
+                section_keywords = list(set(header_keywords + content_keywords))
                 section_evidence = self._filter_evidence_for_section(evidence_base, section_keywords)
-            
-            # Expand this section with evidence
+                
+            # Expand this section with evidence, including the section's content points
             expanded_text = self.expand_markdown_section_with_citations(
-                query=query,
-                all_sections_so_far=text_so_far,
-                section_header=section_header,
-                section_evidence=section_evidence
+            query=query,
+            all_sections_so_far=text_so_far,
+            section_header=section_header,
+            section_content_points=section_content_points,
+            section_evidence=section_evidence
             )
             
             # Track which sources were used in this section (by sequential ID)
@@ -781,7 +1027,7 @@ Return ONLY a JSON object in the following format:
         
         return flat_sections
 
-    def expand_markdown_section_with_citations(self, query, all_sections_so_far, section_header, section_evidence, max_retries=3):
+    def expand_markdown_section_with_citations(self, query, all_sections_so_far, section_header, section_content_points, section_evidence, max_retries=3):
         """
         Expanded version of section expansion that explicitly encourages source citations.
         Includes retry logic for handling JSON parsing failures.
@@ -804,29 +1050,32 @@ Return ONLY a JSON object in the following format:
         
         # Base prompt remains the same
         base_prompt = f"""
-    We have an ongoing answer for the query: "{query}" in Markdown format.
+We have an ongoing answer for the query: "{query}" in Markdown format.
 
-    So far, the collected sections are:
-    {all_sections_so_far}
+So far, the collected sections are:
+{all_sections_so_far}
 
-    Now we want to fill out this section in detail:
-    "{section_header}"
+Now we want to fill out this section in detail:
+"{section_header}"
 
-    Use these relevant sources for this section:
-    {evidence_str}
+Outline points:
+{section_content_points}
 
-    **!!WRITE THE ACTUAL SECION TEXT!!** Don't write '...' or anything that is not the actual content!
-    Be detailed, use bullet points or subheadings if needed,
-    and make sure it flows logically from the sections that came before it.
+Use these relevant sources for this section:
+{evidence_str}
 
-    IMPORTANT: 
-    - Include in-line citations like [Source 1], [Source 2], etc. to attribute information to specific sources.
-    - Only cite sources that actually support the specific information being stated.
-    - Do not cite sources for general knowledge.
-    - Use direct quotes sparingly and always with citation.
-    - DO NOT repeat the section title at the beginning of your text
-    - Make it 500 to 1000 words long.
-    """
+**!!WRITE THE ACTUAL SECTION TEXT!!** Don't write '...' or anything that is not the actual content!
+Be detailed, use bullet points or subheadings if needed,
+and make sure it flows logically from the sections that came before it.
+
+IMPORTANT: 
+- Include in-line citations like [Source 1], [Source 2], etc. to attribute information to specific sources.
+- Only cite sources that actually support the specific information being stated.
+- Do not cite sources for general knowledge.
+- Use direct quotes sparingly and always with citation.
+- DO NOT repeat the section title at the beginning of your text
+- Make it 500 to 1000 words long.
+"""
 
         # Define the JSON schema
         section_schema = {
@@ -838,7 +1087,7 @@ Return ONLY a JSON object in the following format:
                 },
                 "section_text": {
                     "type": "string",
-                    "description": "The Markdown content for this section with citations, 500 to 1000 words long. WRITE THE ACTUAL SECION TEXT HERE! Don't write '...' or anything that is not the actual content."
+                    "description": "The Markdown content for this section with citations, 500 to 1000 words long. WRITE THE ACTUAL SECTION TEXT HERE! Don't write '...' or anything that is not the actual content."
                 }
             },
             "required": ["thinking", "section_text"]
@@ -854,25 +1103,26 @@ Return ONLY a JSON object in the following format:
                     prompt = base_prompt + "\nReturn your content in the specified JSON format."
                 elif attempt == 1:
                     prompt = base_prompt + """
-    IMPORTANT: Ensure you return a valid JSON object with 'thinking' and 'section_text' fields.
-    Be sure to properly escape any quotes or special characters to ensure valid JSON.
-    """
+IMPORTANT: Ensure you return a valid JSON object with 'thinking' and 'section_text' fields.
+Be sure to properly escape any quotes or special characters to ensure valid JSON.
+"""
                 else:
                     prompt = base_prompt + """
-    IMPORTANT: Return only well-formatted JSON with proper escaping of all special characters.
-    Focus on creating valid, parseable JSON while maintaining the quality of your content.
-    """
+IMPORTANT: Return only well-formatted JSON with proper escaping of all special characters.
+Focus on creating valid, parseable JSON while maintaining the quality of your content.
+"""
                 
                 # Always use schema for consistency
-                response_text = self.generate_response(
+                response_obj = self.generate_response(
                     prompt=prompt,
                     schema=section_schema,
-                    temperature=0.7
+                    temperature=0.7,
+                    backend="openai"
                 )
                 
                 # Process response - should be a dictionary if schema worked
-                if isinstance(response_text, dict):
-                    section_text = response_text.get("section_text", "")
+                if isinstance(response_obj, dict):
+                    section_text = response_obj.get("section_text", "")
                     if not isinstance(section_text, str):
                         raise ValueError(f"Invalid section_text in response (attempt {attempt+1})")
                     return section_text
@@ -881,6 +1131,7 @@ Return ONLY a JSON object in the following format:
                     
             except Exception as e:
                 print(f"Error in expand_markdown_section_with_citations (attempt {attempt+1}): {e}")
+                traceback.print_exc()
                 if attempt == max_retries - 1:
                     # Last attempt failed, use fallback
                     break
@@ -1315,6 +1566,7 @@ Return ONLY a JSON object with the following format:
     4. Would work well for finding the exact information needed
     5. Is written in natural, conversational language
     6. Is direct and to the point
+    7. Do not return a question to the user
 
     Examples:
     - Original: "hotels tel aviv"

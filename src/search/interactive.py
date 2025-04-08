@@ -5,41 +5,57 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from .engine import SearchEngine
 
-async def process_follow_up_query(engine, enhanced_query, idx, num_results=3, max_content=2):
+async def process_follow_up_query(engine, follow_up_query, idx, fetched_url_list, num_results=10, max_content=2):
     """Process a single follow-up query concurrently."""
-    print(f"\nFollow-up query {idx+1}: {enhanced_query}")
+    print(f"\nFollow-up query {idx+1}: {follow_up_query}")
     
     # Perform search with follow-up query
-    query_results = await engine.perform_search_async(enhanced_query, num_results=num_results)
+    query_results = await engine.perform_search_async(follow_up_query, num_results=num_results)
     
     if not query_results:
         print(f"No results found for follow-up query {idx+1}")
-        return [], None
-        
+        return [], None, []
+    
+    # Pre-filter results to skip URLs we've already processed
+    filtered_results = []
+    skipped = 0
+    for result in query_results:
+        url = result.get('url', '')
+        if url and url in fetched_url_list:
+            skipped += 1
+            continue
+        filtered_results.append(result)
+    
+    if skipped > 0:
+        print(f"Skipped {skipped} already processed URLs from search results")
+    
     # Display results
-    print(f"Found {len(query_results)} results for follow-up query {idx+1}")
-    for i, result in enumerate(query_results):
+    print(f"Found {len(filtered_results)} new results for follow-up query {idx+1}")
+    for i, result in enumerate(filtered_results):
         print(f"{i+1}. {result['title']}")
         print(f"   URL: {result['url']}")
         print(f"   {result['snippet'][:100]}...\n")
     
-    # Automatically fetch content
+    # Automatically fetch content for new URLs only
     print(f"Fetching content for follow-up query {idx+1}...")
-    fetched_results = await engine.fetch_content_async(enhanced_query, query_results, max_results=max_content)
+    fetched_results, new_urls = await engine.fetch_content_async(
+        follow_up_query, filtered_results, max_results=max_content, 
+        already_processed_urls=fetched_url_list
+    )
     
     # Generate understanding
     if fetched_results:
         print(f"Generating understanding for follow-up query {idx+1}...")
-        understanding = engine.generate_intermediate_answer(enhanced_query, fetched_results)
+        understanding = engine.generate_intermediate_answer(follow_up_query, fetched_results)
         
         return fetched_results, {
             "iteration": idx + 2,  # +2 because first iteration is 1
-            "query": enhanced_query,
+            "query": follow_up_query,
             "understanding": understanding,
             "type": "follow-up"
-        }
+        }, new_urls
     
-    return fetched_results, None
+    return fetched_results, None, new_urls
 
 def interactive_search(llm_client, config=None):
     """Run an interactive search loop."""
@@ -93,7 +109,7 @@ def interactive_search(llm_client, config=None):
                 print(f"   {result['snippet'][:150]}...\n")
             
             # Fetch detailed content for first iteration
-            results = engine.fetch_content(enhanced_query, results, max_results=content_fetch_limit)
+            results, fetched_url_list = engine.fetch_content(enhanced_query, results, max_results=content_fetch_limit)
             print("Detailed content fetched!")
             
             # Generate intermediate answer
@@ -119,7 +135,7 @@ def interactive_search(llm_client, config=None):
                 
                 # Generate follow-up queries based on current results
                 print("Generating follow-up search queries...")
-                follow_up_queries = engine.generate_follow_up_queries(enhanced_query, results, max_queries=2)
+                follow_up_queries = engine.generate_follow_up_queries(enhanced_query, results, max_queries=4)
                 
                 # Process all follow-up queries concurrently
                 iteration_results = []
@@ -129,23 +145,32 @@ def interactive_search(llm_client, config=None):
 
                 # Create tasks explicitly with the engine's event loop
                 tasks = [
-                    loop.create_task(process_follow_up_query(engine, query, j, num_results=3, max_content=2))
-                    for j, query in enumerate(follow_up_queries)
+                    loop.create_task(process_follow_up_query(engine, follow_up_query, idx, fetched_url_list, num_results=10, max_content=2))
+                    for idx, follow_up_query in enumerate(follow_up_queries)
                 ]
 
                 # Run all tasks concurrently
                 follow_up_results = loop.run_until_complete(asyncio.gather(*tasks))
                 
-                # Process results
-                for results_batch, understanding in follow_up_results:
+                # Process results and collect new URLs
+                new_iteration_urls = []
+                for results_batch, understanding, new_urls in follow_up_results:
                     if results_batch:
                         iteration_results.extend(results_batch)
+                        
+                        # Add newly processed URLs to our tracking list
+                        if new_urls:
+                            new_iteration_urls.extend(new_urls)
+                        
                         if understanding:
                             intermediate_understandings.append(understanding)
                             print(f"\n--- Follow-up Understanding ---")
                             print(understanding["understanding"])
                             print("------------------------------------")
-                
+
+                # Update the master URL list for next iteration
+                fetched_url_list.extend(new_iteration_urls)
+
                 # Update results for next iteration
                 all_results.extend(iteration_results)
                 
