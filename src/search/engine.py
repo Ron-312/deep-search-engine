@@ -174,6 +174,9 @@ class SearchEngine:
             results: List of search results
             max_results: Maximum number of results to fetch content for
             concurrent_fetches: Number of concurrent pages to fetch
+            
+        Returns:
+            Tuple of (processed_results, newly_processed_urls)
         """
         # Check if scraper is initialized
         if not self.scraper:
@@ -181,11 +184,12 @@ class SearchEngine:
             self._initialize_scraper()
             if not self.scraper:
                 print("Failed to initialize browser. Cannot fetch content.")
-                return results
+                return results, []
         
         # Filter to top results, skipping already processed URLs
         top_results = []
         skipped_count = 0
+        newly_processed_urls = []  # Add this to track URLs
         
         for result in results:
             url = result.get('url', '')
@@ -207,7 +211,7 @@ class SearchEngine:
         
         if not top_results:
             print("No new URLs to process")
-            return results
+            return results, []
             
         print(f"Processing {len(top_results)} results with concurrent fetch and analysis...")
         
@@ -225,6 +229,7 @@ class SearchEngine:
                     
                     # Mark URL as processed before fetching
                     self.processed_urls.add(url)
+                    newly_processed_urls.append(url)  # Add this line
                     
                     print(f"🌐 Fetching: {title}")
                     # Fetch the content
@@ -274,33 +279,32 @@ class SearchEngine:
                     }
                     processed_results.append(result)
             
-            # Create tasks to process batches of results
+            # Create tasks for all results and run them concurrently
+            tasks = []
             for i in range(0, len(top_results), concurrent_fetches):
                 batch = top_results[i:min(i+concurrent_fetches, len(top_results))]
-                print(f"Starting batch {i//concurrent_fetches + 1}/{(len(top_results)-1)//concurrent_fetches + 1} ({len(batch)} pages)...")
+                print(f"Processing batch {i//concurrent_fetches + 1} ({len(batch)} pages)...")
+                batch_tasks = [process_single_result(result) for result in batch]
+                tasks.extend(batch_tasks)
+                await asyncio.gather(*batch_tasks)
                 
-                # Create tasks for this batch and run them concurrently
-                tasks = [process_single_result(result) for result in batch]
-                await asyncio.gather(*tasks)
-                
-                # Add delay between batches
                 if i + concurrent_fetches < len(top_results):
-                    delay_time = random.uniform(1.0, 2.0)
-                    print(f"Waiting {delay_time:.1f}s before next batch...")
-                    await asyncio.sleep(delay_time)
+                    delay = random.uniform(1.0, 2.0)
+                    print(f"Waiting {delay:.1f}s before next batch...")
+                    await asyncio.sleep(delay)
             
-            return processed_results
-        
+            return processed_results, newly_processed_urls
+            
         try:
             # Run the async function
-            enhanced_results = self.event_loop.run_until_complete(fetch_and_analyze_all())
+            processed_results, _ = self.event_loop.run_until_complete(fetch_and_analyze_all())
             
             # Determine how many fetches were successful
-            successful_count = sum(1 for r in enhanced_results if r.get('page_analysis', {}).get('relevance_score', 0) > 0)
-            print(f"Content processing complete: {successful_count}/{len(top_results)} successful")
+            successful_count = sum(1 for r in processed_results if r.get('page_analysis', {}).get('relevance_score', 0) > 0)
+            print(f"Content processing complete: {successful_count}/{len(processed_results)} successful")
             
-            # Return the enhanced results
-            return enhanced_results
+            # Return the enhanced results AND newly processed URLs
+            return processed_results, newly_processed_urls
             
         except Exception as e:
             print(f"Error during content processing: {e}")
@@ -315,9 +319,10 @@ class SearchEngine:
                     "key_points": []
                 }
             
-            return top_results
+            # Always return a tuple of (results, urls)
+            return top_results, newly_processed_urls
         
-    async def fetch_content_async(self, enhanced_query, results, max_results=3, concurrent_fetches=5):
+    async def fetch_content_async(self, enhanced_query, results, max_results=3, concurrent_fetches=5, already_processed_urls=None):
         """
         Async version of fetch_content - Fetch detailed content and analyze pages concurrently.
         
@@ -326,6 +331,10 @@ class SearchEngine:
             results: List of search results
             max_results: Maximum number of results to fetch content for
             concurrent_fetches: Number of concurrent pages to fetch
+            already_processed_urls: Optional list of additional URLs to consider already processed
+            
+        Returns:
+            Tuple of (processed_results, newly_processed_urls)
         """
         # Check if scraper is initialized
         if not self.scraper:
@@ -333,7 +342,12 @@ class SearchEngine:
             self._initialize_scraper()
             if not self.scraper:
                 print("Failed to initialize browser. Cannot fetch content.")
-                return results
+                return results, []
+        
+        # Combine internal processed URLs with passed list
+        all_processed_urls = set(self.processed_urls)
+        if already_processed_urls:
+            all_processed_urls.update(already_processed_urls)
         
         # Filter to top results, skipping already processed URLs
         top_results = []
@@ -345,7 +359,7 @@ class SearchEngine:
                 continue
                 
             # Skip already processed URLs
-            if url in self.processed_urls:
+            if url in all_processed_urls:
                 print(f"Skipping already processed URL: {url}")
                 skipped_count += 1
                 continue
@@ -359,12 +373,14 @@ class SearchEngine:
         
         if not top_results:
             print("No new URLs to process")
-            return results
+            return results, []
             
         print(f"Processing {len(top_results)} results with concurrent fetch and analysis...")
         
         # Create a new empty list to hold processed results
         processed_results = []
+        # Track newly processed URLs
+        newly_processed_urls = []
         
         # Define an async helper function that processes a single result
         async def process_single_result(result):
@@ -374,6 +390,7 @@ class SearchEngine:
                 
                 # Mark URL as processed before fetching
                 self.processed_urls.add(url)
+                newly_processed_urls.append(url)
                 
                 print(f"🌐 Fetching: {title}")
                 # Fetch the content
@@ -443,8 +460,8 @@ class SearchEngine:
             successful_count = sum(1 for r in processed_results if r.get('page_analysis', {}).get('relevance_score', 0) > 0)
             print(f"Content processing complete: {successful_count}/{len(processed_results)} successful")
             
-            # Return the processed results
-            return processed_results
+            # Return both the processed results and newly processed URLs
+            return processed_results, newly_processed_urls
             
         except Exception as e:
             print(f"Error during content processing: {e}")
@@ -459,7 +476,7 @@ class SearchEngine:
                     "key_points": []
                 }
             
-            return top_results
+            return top_results, newly_processed_urls
     
     def generate_intermediate_answer(self, query, results):
         """Generate an intermediate answer based on current results."""
