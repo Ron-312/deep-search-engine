@@ -1,0 +1,6 @@
+{
+  "github.copilot.chat.commitMessageGeneration.instructions": [{
+    "text": "Be extremely detailed with the commit message. Include the purpose of the change, the files affected (use file names), and any relevant context.",
+  }],
+  "python.defaultInterpreterPath": "F:/Projects/deep-search-engine/venv/Scripts/python.exe"
+}

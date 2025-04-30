@@ -56,7 +56,7 @@ Creates beautiful HTML presentations of search results:
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/your-username/deep-search-engine.git
+git clone https://github.com/Ron-312/deep-search-engine
 cd deep-search-engine
 ```
 
